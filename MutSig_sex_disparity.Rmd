@@ -1,0 +1,357 @@
+---
+title: "Sex disparity of Mutational Signatures"
+output: 
+  rmdformats::readthedown:
+    highlight: kate
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+
+### Introduction:
+
+1. Somatic mutations found in cancer genomes were originated from different mutational processes
+2. Mutation burden varied among and within cancer types
+3. The difference in mutation burden imply the deviation of mutation rate
+4. Age-related signatures will be focus on given the limitation of exposure time data
+
+### Data preparation：
+
+* [Signature contribution data(FULL_SET.031918)](https://dcc.icgc.org/releases/PCAWG/mutational_signatures/Signatures_in_Samples/SA_Signatures_in_Samples/SA_Full_PCAWG_Attributions)
+* [Sample clinical and histology data(August2016_v9)](https://dcc.icgc.org/releases/PCAWG/clinical_and_histology)
+* [Patient clinical and histology data(August2016_v9)](https://dcc.icgc.org/releases/PCAWG/clinical_and_histology)
+
+```{r }
+
+library(tidyverse)
+
+# setwd("/Users/jianlongliao/xiaolonggeのhome/Project_Exploration")
+setwd("G:/xiaolonggeのhome/ongoing_research/Mutational_Signatures_Research/Exploration")
+
+donor_data <- read_tsv("Data/pcawg_donor_clinical_August2016_v9.txt") # Patient clinical
+sam_data <- read_tsv("Data/pcawg_specimen_histology_August2016_v9.txt") # Sample clinical
+sig_aty <- read_tsv("Data/SignatureAnalyzer_SNV.activity.FULL_SET.031918.txt") # Signature contribution
+
+```
+
+1. Extract sample neccessary info（<u>cancer type, sex and age at diagnosis</u>）
+
+```{r}
+
+sam_comb_data <- sam_data %>%
+  distinct(icgc_specimen_id, .keep_all = TRUE) %>%
+  left_join(donor_data, by = "icgc_donor_id") %>%
+  filter(!is.na(histology_abbreviation)) %>% 
+  select(icgc_specimen_id, histology_abbreviation, donor_sex, donor_age_at_diagnosis)
+
+```
+
+```{r echo=FALSE}
+DT::datatable(head(sam_comb_data), options = list(dom = 't'))
+```
+
+
+2. Extract sample signature exposure info
+
+```{r}
+sig_aty_df <- sig_aty %>%
+  pivot_longer(cols = -X1, names_to = "sample", values_to = "exposure") %>%
+  rename(signature = X1) %>%
+  separate(sample, into = c("histology_abbreviation", "icgc_specimen_id"), "__") %>%
+  select(-histology_abbreviation)
+```
+
+```{r echo=FALSE}
+DT::datatable(head(sig_aty_df), options = list(dom = 't'))
+```
+
+3. Merge sample and signature exposure data
+
+```{r}
+
+sig_comb_data <- sig_aty_df %>%
+  left_join(sam_comb_data, by = "icgc_specimen_id")
+
+```
+
+```{r echo=FALSE}
+DT::datatable(head(sig_comb_data), options = list(dom = 't'))
+```
+
+### Identify age-related signatures in all samples
+
+```{r}
+
+sig_comb_stat <- sig_comb_data %>% 
+  group_by(signature) %>% 
+  summarise(zero_exp_frac = signif(mean(exposure == 0), 4), 
+            min_exp = signif(min(exposure), 4), 
+            max_exp = signif(max(exposure), 4),
+            mean_exp = signif(mean(exposure), 4),
+            median_exp = signif(median(exposure), 4),
+            sd_exp = signif(sd(exposure), 4))
+
+```
+
+```{r echo=FALSE}
+DT::datatable(sig_comb_stat, options = list(scrollX = TRUE))
+```
+
+```{r}
+
+total_rlm_model <- sig_comb_data %>% 
+  mutate(signature = fct_inorder(signature)) %>% 
+  split(.$signature) %>% 
+  map(possibly(~MASS::rlm(exposure ~ donor_age_at_diagnosis, data = .), NA))
+
+```
+
+
+
+```{r}
+
+total_lm_p <- sig_comb_data %>% 
+  mutate(signature = fct_inorder(signature)) %>% 
+  split(.$signature) %>% 
+  map_chr(possibly(~summary(lm(exposure ~ donor_age_at_diagnosis, data = .))$coefficients[2, 4], NA))
+
+```
+
+
+```{r}
+total_rlm_p <- total_rlm_model %>% 
+  map_chr(possibly(~sfsmisc::f.robftest(., var = 'donor_age_at_diagnosis')$p.value, NA))
+
+```
+
+
+```{r}
+
+total_rlm_result <- total_rlm_model %>% 
+  map(possibly(~summary(.)$coefficients['donor_age_at_diagnosis', c('Value', 'Std. Error')], NA)) %>%
+  bind_rows() %>% 
+  mutate(signature = unique(sig_comb_data$signature),
+         p_value = total_rlm_p, 
+         q_value = p.adjust(p_value, method = "BH"),
+         q_signi = q_value < 0.05)
+ 
+```
+
+
+
+
+
+```{r}
+total_rlm_result
+```
+
+
+
+
+```{r}
+
+# linear regression for signature exposure and age divided by cancer type 
+
+sig_age_rlm <- sig_comb_data %>%
+  filter(histology_abbreviation %in% sex_age_stat$histology_abbreviation) %>%
+  split(.$histology_abbreviation) %>% # for each cancer type
+  map(function(cancer_df){
+    cancer_df %>%
+      split(cancer_df$donor_sex) %>% # for each sex
+      map(function(can_sex_result){
+        sig_lm <- can_sex_result %>%
+          split(can_sex_result$signature) %>% # for each signature
+          map(possibly(~summary(lm(exposure ~ donor_age_at_diagnosis, data = .))$coefficients[2, c(1, 4)], NA)) %>% # linear regression
+          bind_rows() %>%
+          mutate(signature = unique(can_sex_result$signature),
+                 q_value = p.adjust(`Pr(>|t|)`, method = "BH"),
+                 q_signi = q_value < 0.05,
+                 donor_sex = unique(can_sex_result$donor_sex),
+                 histology_abbreviation = unique(can_sex_result$histology_abbreviation))
+      }) %>%
+      bind_rows()
+  }) %>%
+  bind_rows()
+
+
+
+
+```
+
+
+
+
+```{r echo=FALSE}
+knitr::knit_exit()
+```
+
+
+
+### Identify sex-biased and age-related signatures
+
+
+
+
+
+
+
+2. Merge sample age and signature exposure data
+   * Focus on cancer types which have enough both genders (**> 10 samples**, respectively) to guarantee the statistical power
+
+```{r}
+
+# limited to specific cancer types based on sufficient sex info
+
+sex_stat_lim <- sam_comb_data %>% 
+  count(histology_abbreviation, donor_sex) %>% 
+  pivot_wider(names_from = donor_sex, values_from = n, values_fill = 0) %>% 
+  filter(female >= 10, male >= 10) %>% 
+  pivot_longer(-histology_abbreviation, names_to = 'donor_sex', values_to = 'count')
+
+
+# statistics of age and exposure
+
+exposure_stat <- sig_comb_data %>% 
+  filter(!is.na(exposure)) %>%
+  group_by(histology_abbreviation, donor_sex) %>%
+  summarise(min_exp = min(exposure), 
+            max_exp = max(exposure),
+            mean_exp = signif(mean(exposure), 4),
+            sd_exp = signif(sd(exposure), 4))  
+
+sex_age_stat <- sam_comb_data %>%
+  filter(histology_abbreviation %in% sex_stat_lim$histology_abbreviation, !is.na(donor_age_at_diagnosis)) %>% 
+  group_by(histology_abbreviation, donor_sex) %>%
+  summarise(min_age = min(donor_age_at_diagnosis), 
+            max_age = max(donor_age_at_diagnosis),
+            mean_age = signif(mean(donor_age_at_diagnosis), 4),
+            sd_age = signif(sd(donor_age_at_diagnosis), 4)) %>% 
+  left_join(sex_stat_lim, by = c('histology_abbreviation', 'donor_sex')) %>% 
+  select(histology_abbreviation, donor_sex, count, everything()) %>% 
+  left_join(exposure_stat, by = c('histology_abbreviation', 'donor_sex'))
+
+```
+
+**Table1: Age distribution of satisfactory cancer types**
+
+```{r echo=FALSE}
+sex_age_stat %>% DT::datatable(options = list(scrollX = TRUE))
+```
+
+3. Conduct simple linear regression analysis
+
+* Simple linear regression between age and signature exposure in a specific cancer type divided by sex
+
+```{r}
+
+
+
+# linear regression for signature exposure and age divided by genders and cancer type 
+
+sig_age_lm <- sig_comb_data %>%
+  filter(histology_abbreviation %in% sex_age_stat$histology_abbreviation) %>% 
+  split(.$histology_abbreviation) %>% # for each cancer type
+  map(function(cancer_df){
+    cancer_df %>% 
+      split(cancer_df$donor_sex) %>% # for each sex
+      map(function(can_sex_result){
+        sig_lm <- can_sex_result %>%
+          split(can_sex_result$signature) %>% # for each signature
+          map(possibly(~summary(lm(exposure ~ donor_age_at_diagnosis, data = .))$coefficients[2, c(1, 4)], NA)) %>% # linear regression
+          bind_rows() %>%
+          mutate(signature = unique(can_sex_result$signature), 
+                 q_value = p.adjust(`Pr(>|t|)`, method = "BH"), 
+                 q_signi = q_value < 0.05, 
+                 donor_sex = unique(can_sex_result$donor_sex), 
+                 histology_abbreviation = unique(can_sex_result$histology_abbreviation))
+      }) %>%
+      bind_rows()
+  }) %>% 
+  bind_rows()
+
+```
+
+* Search for sex-biased age-related signatures
+
+```{r}
+
+# signatures showing sex disparity in age correlation
+
+sig_age_sexdf <- sig_age_lm %>%
+  select(signature, q_signi, donor_sex, histology_abbreviation) %>% 
+  pivot_wider(names_from = donor_sex, values_from = q_signi) %>% 
+  filter(female != male, !is.na(female), !is.na(male))
+
+sexdf_info <- sig_age_lm %>% 
+  semi_join(sig_age_sexdf, by = c('signature', 'histology_abbreviation')) %>%
+  mutate(Estimate = signif(Estimate, 4), `Pr(>|t|)` = signif(`Pr(>|t|)`, 4), q_value = signif(q_value, 4)) %>% 
+  select(histology_abbreviation, signature, donor_sex, everything()) %>% 
+  arrange(histology_abbreviation, signature)
+
+```
+
+**Table2: Sex-biased age-related signatures**
+
+```{r echo=FALSE}
+sexdf_info %>% DT::datatable(options = list(scrollX = TRUE))
+```
+
+
+
+```{r}
+# plotting
+
+plot_data <- sig_comb_data %>% 
+  semi_join(sig_age_sexdf, by = c('signature', 'histology_abbreviation')) %>% 
+  left_join(sexdf_info, by = c('signature', 'histology_abbreviation', 'donor_sex')) %>% 
+  mutate(x_coor = 25, y_coor = 4000, `Pr(>|t|)` = str_c('p = ', signif(`Pr(>|t|)`, 3)))
+
+uni_sig <- unique(plot_data$signature)
+
+```
+
+
+## {.tabset .tabset-pills}
+
+```{r, results='asis'}
+
+for(sig in uni_sig){
+  
+  # sig <- uni_sig[1]
+  sub_data <- plot_data %>% filter(signature %in% sig)
+  # up_outlier <- quantile(sub_data$exposure)[4] + 1.5 * IQR(sub_data$exposure)
+  # ratio_val <- 100/up_outlier
+  
+  cat('###',sig,' \n')
+  print(ggplot(sub_data, aes(donor_age_at_diagnosis, exposure)) +
+       geom_point(col = "darkgreen") +
+       geom_smooth(method = 'lm', col = "darkred") +
+       coord_fixed(ylim = c(0, 5000), ratio = 1/100) +
+       # coord_fixed(ylim = c(0, up_outlier), ratio = ratio_val) +
+       geom_text(aes(x_coor, y_coor, label = `Pr(>|t|)`), 
+                 data = distinct(sub_data, histology_abbreviation, donor_sex, .keep_all = TRUE), size = 3) +
+       facet_grid(donor_sex ~ histology_abbreviation) + 
+       theme_bw() +
+       theme(axis.text.x = element_blank(), 
+             axis.ticks.x = element_blank(), 
+             panel.grid = element_blank(), 
+             strip.background = element_blank()))
+  cat(' \n \n')
+
+}
+
+```
+
+
+```{r echo=FALSE}
+knitr::knit_exit()
+```
+
+
+
+
+
+

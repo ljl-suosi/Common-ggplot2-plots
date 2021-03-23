@@ -1,0 +1,424 @@
+---
+title: "Linear Regression with Age and MutSignature"
+output: 
+  rmdformats::readthedown:
+    highlight: kate
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+options(digits = 3, htmlwidgets.TOJSON_ARGS = list(na = 'string'))
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, dpi = 300)
+```
+
+# Introduction
+
+Previously, we found the apparent deviation between robust regression results when using Matlab and R even
+with the same data. We intend to explore the detail which leads to the difference.
+
+# Data Preparation
+
+## Data Source
+
+Matlab format data downloaded from supplementary data of Alexandrov et al([Clock-like mutational processes in human somatic cells](https://www.nature.com/articles/ng.3441#Sec15)), including:
+
+1. Table_S1.mat(sample age info)
+2. Table_S2.mat(mutSig exposure info)
+
+
+
+```{r, out.height = "460px", out.width='800px'}
+
+options(htmlwidgets.TOJSON_ARGS = NULL)
+library(heatmaply)
+heatmaply(mtcars, k_row = 3, k_col = 2)
+
+```
+
+
+## Data loading and Processing
+
+### Data loading
+
+```{r eval=FALSE}
+
+sam_age_tab1 <- R.matlab::readMat('F:/Table_S1.mat')
+sam_exp_tab2 <- R.matlab::readMat('F:/Table_S2.mat')
+
+```
+
+```{r eval=FALSE, echo=FALSE}
+
+save(sam_age_tab1, sam_exp_tab2, file = 'F:/Table_S1_2.Rdata')
+
+```
+
+```{r echo=FALSE}
+
+load('F:/Table_S1_2.Rdata')
+
+```
+
+### Data merging
+
+* Retain samples with age over 0
+* Based on mutational signatures identified from the global cohort, for each individual, the exposure of signatures which didn't exist in that sample was set 0
+* Note the special case that one sample could be diagnosed as two or more different cancer types. In our cohort, only one sample (i.e. s_266) was the case in which the miserable patent suffered from Chronic lymphocytic leukaemia and Head and neck cancer. In this situation, we only take the exposure data which appear first of intersect signatures (if any).
+
+```{r}
+
+options(htmlwidgets.TOJSON_ARGS = list(na = 'string'))
+library(tidyverse)
+library(kableExtra)
+
+# age info from tab1
+
+sam_age_tib1 <- sam_age_tab1[c('cancer.types', 'samples', 'ages')] %>% 
+  map(~unlist(.)) %>% 
+  bind_rows() %>% 
+  select(-cancer.types) %>% 
+  filter(ages > 0)
+
+# mutsig exp info from tab2
+
+sam_exp_tib2 <- sam_exp_tab2 %>% 
+  map(~unlist(.)) %>% 
+  bind_rows()
+
+# merge
+
+sig_fct_lev <- str_sort(unique(sam_exp_tib2$signatures), numeric = TRUE)
+age_samples <- sam_age_tib1 %>% distinct(samples)
+
+code_sam_comb <- sam_exp_tib2 %>% 
+  semi_join(sam_age_tib1, by = 'samples') %>% 
+  select(-cancer.types) %>% 
+  group_by(signatures) %>% 
+  group_modify(~ {
+    distinct(., samples, .keep_all = TRUE) %>% 
+      right_join(age_samples) %>% 
+      replace_na(list(mutations = 0))
+  }) %>% 
+  left_join(sam_age_tib1, by = 'samples')
+
+```
+
+```{r echo=FALSE}
+DT::datatable(head(code_sam_comb), 
+              caption = 'Table 1 Display of combined Data', 
+              rownames = FALSE, 
+              options = list(dom = 't')) %>% 
+  DT::formatRound('mutations', 3)
+```
+
+# Data descriptive statistics
+
+```{r}
+
+zero_mut_stat <- code_sam_comb %>% 
+  group_by(signatures) %>% 
+  summarise(zero_pct = mean(mutations == 0), `#non_zero` = sum(mutations != 0)) %>% 
+  mutate(variable = 'mutations')
+
+code_sam_comb %>% 
+  select(-samples) %>% 
+  mutate(signatures = factor(signatures, levels = sig_fct_lev)) %>% 
+  group_by(signatures) %>% 
+  skimr::skim() %>% # descriptive statistics
+  set_names(map_chr(str_split(colnames(.), '\\.'), ~ifelse(length(.) > 1, .[2], .))) %>% 
+  left_join(zero_mut_stat, by = c('signatures', 'skim_variable' = 'variable')) %>% 
+  select(signatures:skim_variable, mean:sd, zero_pct, `#non_zero`, p0:hist) %>% 
+  mutate_if(is.numeric, ~signif(., 3)) %>% 
+  DT::datatable(caption = 'Table 2 Descriptive statistics of sample age and exposure of each signature', 
+                rownames = FALSE, 
+                options = list(dom = 'tp')) %>% 
+  DT::formatStyle('signatures', 
+                  target = 'row', 
+                  backgroundColor = DT::styleEqual(str_c('Signature ', c(1, 5, 23, 24)), c('green', 'green', '#D7261E', '#D7261E')))
+
+```
+
+* Except signature 1, 2 and 5, almost all signatures contain extremely high (> 0.95) zero_pct (referred to the percentage of samples in which the mutation attributed to a particular signature is zero). As extreme cases, signature 23 and 24 only have 0 and 4 non-zero values, respectively.
+* The highly skew distribution of signature exposure is bound to compromise the effect of linear regression. 
+
+# Simple Linear Regression
+
+```{r}
+
+code_lm <- code_sam_comb %>% 
+  mutate(signatures = factor(signatures, levels = sig_fct_lev)) %>%
+  group_by(signatures) %>% 
+  group_map(~lm(mutations ~ ages, data = .)) %>% 
+  map_dfr(~broom::tidy(.)) %>% 
+  filter(term != '(Intercept)') %>% 
+  mutate(signatures = sig_fct_lev, p_val_adj = p.adjust(p.value, method = 'BH')) %>% 
+  select(signatures, estimate:p_val_adj)
+
+```
+
+
+```{r echo=FALSE}
+code_lm %>% 
+  mutate_if(is.numeric, ~signif(., 3)) %>% 
+  DT::datatable(caption = 'Table 3 Simple Linear Regression result of all signatures', 
+                rownames = FALSE, 
+                options = list(dom = 'tp')) %>% 
+  DT::formatStyle('p_val_adj', 
+                  target = 'row', 
+                  backgroundColor = DT::styleInterval(0.05, c('yellow', NA)))
+```
+
+# Robust Linear Regression
+
+## MASS::rlm
+
+```{r}
+
+code_rlm_model <- code_sam_comb %>% 
+  mutate(signatures = factor(signatures, levels = sig_fct_lev)) %>% 
+  group_by(signatures) %>% 
+  group_map(~MASS::rlm(mutations ~ ages, data = .))
+
+# rlm p value was computed with sfsmisc::f.robftest method because MASS::rlm doesn't give p values
+
+code_rlm_p <- code_rlm_model %>% 
+  map_dbl(possibly(~sfsmisc::f.robftest(., var = 'ages')$p.value, NA))
+
+code_rlm <- code_rlm_model %>% 
+  map_dfr(~broom::tidy(.)) %>% 
+  filter(term != '(Intercept)') %>% 
+  mutate(signatures = sig_fct_lev, p.value = code_rlm_p, 
+         p_val_adj = p.adjust(p.value, method = 'BH')) %>% 
+  select(signatures, estimate:p_val_adj)
+
+```
+
+```{r echo=FALSE}
+
+code_rlm %>% 
+  mutate_if(is.numeric, ~signif(., 3)) %>% 
+  DT::datatable(caption = 'Table 4 Robust regression (rlm)  result of all signatures', 
+                rownames = FALSE, 
+                options = list(dom = 'tp')) %>% 
+  DT::formatStyle('p_val_adj', 
+                  target = 'row', 
+                  backgroundColor = DT::styleInterval(0.05, c('yellow', NA)))
+
+```
+
+
+**`r sum(na.omit(code_lm$p_val_adj < 0.05))`** mutational signatures showed significance with simple linear regression, while **`r sum(na.omit(code_rlm$p_val_adj < 0.05))`** signatures were found to be significant through robust linear regression!!!  
+That's unbelievable because **robust** regression should be more robust and stricter!
+
+## robust::lmRob
+
+```{r}
+
+code_lmRob <- code_sam_comb %>% 
+  mutate(signatures = factor(signatures, levels = sig_fct_lev)) %>% 
+#  arrange(mutations) %>% 
+  group_by(signatures) %>% 
+  group_map(possibly(~summary(robust::lmRob(mutations ~ ages, data = .))$coefficients[2, ], set_names(c(NA, NA, NA, NA), c('Estimate', 'Std. Error', 't value', 'Pr(>|t|)')))) %>% 
+  bind_rows() %>% 
+  rename(estimate = Estimate, std.error = `Std. Error`, statistic = `t value`, p.value = `Pr(>|t|)`) %>% 
+  mutate(signatures = sig_fct_lev, p_val_adj = p.adjust(p.value, method = 'BH')) %>% 
+  select(signatures, everything())
+
+```
+
+```{r echo=FALSE}
+code_lmRob %>% 
+  mutate_if(is.numeric, ~signif(., 3)) %>% 
+  DT::datatable(caption = 'Table 5 Robust Regression (lmRob) result of all signatures', 
+                rownames = FALSE, 
+                options = list(dom = 'tp')) %>% 
+  DT::formatStyle('p_val_adj', 
+                  target = 'row', 
+                  backgroundColor = DT::styleInterval(0.05, c('yellow', NA)))
+```
+
+We could find that the p value of `r sum(is.na(code_lmRob$p.value))` signatures was unavailable, which means robust::lmRob encounter error when a
+Notably, when we 
+
+```{r echo=FALSE}
+
+code_lmRob_sort <- code_sam_comb %>% 
+  mutate(signatures = factor(signatures, levels = sig_fct_lev)) %>% 
+  arrange(mutations) %>% 
+  group_by(signatures) %>% 
+  group_map(possibly(~summary(robust::lmRob(mutations ~ ages, data = .))$coefficients[2, ], set_names(c(NA, NA, NA, NA), c('Estimate', 'Std. Error', 't value', 'Pr(>|t|)')))) %>% 
+  bind_rows() %>% 
+  rename(estimate = Estimate, std.error = `Std. Error`, statistic = `t value`, p.value = `Pr(>|t|)`) %>% 
+  mutate(signatures = sig_fct_lev, p_val_adj = p.adjust(p.value, method = 'BH')) %>% 
+  select(signatures, everything())
+
+```
+
+```{r echo=FALSE}
+code_lmRob_sort %>% 
+  mutate_if(is.numeric, ~signif(., 3)) %>% 
+  DT::datatable(caption = 'Table 6 Robust Regression (lmRob) result of all signatures when changing order', 
+                rownames = FALSE, 
+                options = list(dom = 'tp')) %>% 
+  DT::formatStyle('p_val_adj', 
+                  target = 'row', 
+                  backgroundColor = DT::styleInterval(0.05, c('yellow', NA)))
+```
+
+
+## robustbase::lmrob
+
+
+```{r}
+
+code_lmrob <- code_sam_comb %>% 
+  mutate(signatures = factor(signatures, levels = sig_fct_lev)) %>% 
+  group_by(signatures) %>% 
+  group_map(possibly(~summary(robustbase::lmrob(mutations ~ ages, data = .))$coefficients[2, ], set_names(c(NA, NA, NA, NA), c('Estimate', 'Std. Error', 't value', 'Pr(>|t|)')))) %>% 
+  bind_rows() %>% 
+  rename(estimate = Estimate, std.error = `Std. Error`, statistic = `t value`, p.value = `Pr(>|t|)`) %>% 
+  mutate(signatures = sig_fct_lev, p_val_adj = p.adjust(p.value, method = 'BH')) %>% 
+  select(signatures, everything())
+
+```
+
+```{r echo=FALSE}
+code_lmrob %>% 
+  mutate_if(is.numeric, ~signif(., 3)) %>% 
+  DT::datatable(caption = 'Table 7 Robust Regression (lmrob) result of all signatures', 
+                rownames = FALSE, 
+                options = list(dom = 'tp')) %>% 
+  DT::formatStyle('p_val_adj', 
+                  target = 'row', 
+                  backgroundColor = DT::styleInterval(0.05, c('yellow', NA)))
+```
+
+
+
+```{r}
+knitr::knit_exit()
+```
+
+
+
+
+# Comparison between SLR and RLR
+
+## Combine slm and rlm summary
+
+```{r}
+
+comb_srlm <- code_lm %>% 
+  left_join(code_rlm, by = 'signature', suffix = c('_lm', '_Mass_rlm')) %>% 
+  left_join(code_lmRob, by = 'signature') %>% 
+  select(signature, str_sort(colnames(.)[-1]))
+
+```
+
+```{r echo=FALSE}
+DT::datatable(comb_srlm)
+```
+
+
+
+```{r}
+knitr::knit_exit()
+```
+
+
+
+## Plotting
+
+### Plotting data preparation
+
+```{r}
+
+rlm_plot_data <- code_rlm %>% 
+  mutate(method = 'rlm')
+
+plot_data <- code_lm %>% 
+  mutate(method = 'lm') %>% 
+  bind_rows(rlm_plot_data) %>% 
+  separate(signature, c(NA, 'sig_id'), ' ', remove = FALSE) %>% 
+  mutate(sig_id = factor(sig_id, str_replace(sig_fct_lev, 'Signature ', '')))
+
+```
+
+### Comparison of Estimation(with standard error) between lm and rlm
+
+```{r}
+
+ggplot(plot_data, aes(sig_id, estimate, ymin = estimate - se_val, ymax = estimate + se_val)) +
+  geom_pointrange(aes(col = method), size = 0.2) +
+  labs(x = NULL, col = NULL) +
+  geom_hline(yintercept = 0, col = 'grey60') +
+  ggsci::scale_color_nejm() +
+  theme_classic() +
+  theme(axis.ticks.x = element_blank(), strip.background = element_blank(), axis.text.x = element_text(angle = 45, vjust = 0.5, hjust = 0.5))
+
+```
+
+From the figure, we observed that *estimate* values evaluated by robust regression are lower compared with simple linear regression, consonant with the alleviation of effect caused by outliers (i.e. the hypermutators).
+
+
+### Comparison of t value statistics between lm and rlm
+
+```{r}
+
+ggplot(plot_data, aes(sig_id, t_val, fill = method)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  ggsci::scale_fill_nejm() +
+  labs(x = NULL, y = "t value", fill = NULL) +
+  theme_classic() +
+  theme(axis.ticks.x = element_blank(), axis.text.x = element_text(angle = 45, vjust = 0.5, hjust = 0.5))
+
+```
+
+Almost all absolute t values computed by robust regression are higher than ones in simple linear regression, **indicating the significance tendency of mutational signatures with using robust linear regression?**
+
+
+### Comparison of p value statistics between lm and rlm
+
+```{r dev = 'pdf', out.height = "460px", out.width='800px'}
+
+ggplot(comb_srlm, aes(p_val_adj_lm, p_val_adj_rlm), size = 2) +
+  geom_point(col = 'grey60', data = filter(comb_srlm, p_val_adj_lm >= 0.05, p_val_adj_rlm >= 0.05)) +
+  geom_point(col = 'red', data = filter(comb_srlm, p_val_adj_lm < 0.05)) +
+  geom_point(pch = 8, data = filter(comb_srlm, p_val_adj_rlm < 0.05)) +
+  ggrepel::geom_text_repel(aes(label = signature), size = 1.5, max.overlaps = 20) +
+  labs(x = 'p value in lm', y = 'p value in rlm') +
+  theme_classic()
+
+```
+
+**`r sum(na.omit(code_lm$p_val_adj < 0.05))`** mutational signatures showed significance with simple linear regression, while **`r sum(na.omit(code_rlm$p_val_adj < 0.05))`** signatures were found to be significant through robust linear regression!!!  
+That's unbelievable because **robust** regression should be more robust and stricter!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
